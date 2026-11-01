@@ -1,0 +1,184 @@
+# ==============================================================================
+# LAMMPS: Additive Friction Stir Deposition (AFSD) -- v3
+#         soft Al feedstock on a firm Cu substrate
+#
+# Changes from v2:
+#   - materials swapped: Al rod (feed) on Cu substrate
+#   - box commensurate with the Cu lattice (67 x 45 cells)
+#   - rod tip starts 2 A above the substrate (no initial atom overlap)
+#   - slower kinematics: edge speed 600 m/s instead of 3000 m/s
+#
+# Types: 1 = Al stock (rigid)   2 = Cu substrate   3 = W tool   4 = Al deposited
+# ==============================================================================
+
+units           metal
+dimension       3
+boundary        p p f
+atom_style      atomic
+atom_modify     map array
+
+# ------------------------------------------------------------------
+# 1. GEOMETRY
+# ------------------------------------------------------------------
+variable        a_sub        equal 3.615                  # Cu substrate lattice
+variable        a_rod        equal 4.05                   # Al feedstock lattice
+variable        nx_cells     equal 67                     # box x = 242.2 A
+variable        ny_cells     equal 45                     # box y = 162.7 A
+variable        Lx           equal ${nx_cells}*${a_sub}
+variable        Ly           equal ${ny_cells}*${a_sub}
+variable        Lz           equal 190.0
+
+variable        r_tool       equal 30.0     # shoulder outer radius
+variable        r_inner      equal 17.0     # bore radius (> rod corner distance 15.0)
+variable        h_layer      equal 8.0      # layer thickness = tool standoff
+variable        r_rod        equal 12.0     # equivalent radius -> square side 21.3 A
+
+variable        z_sub_top    equal 40       # substrate thickness
+variable        tip_gap      equal 2.0      # rod tip starts this far above substrate
+variable        tool_height  equal 60
+variable        rod_extra    equal 60       # rod above the tool (feed reserve)
+
+variable        cx           equal 60.0     # track start
+variable        cy           equal ${Ly}/2
+variable        half_side    equal ${r_rod}*sqrt(PI)/2
+
+variable        z_rod_bot    equal ${z_sub_top}+${tip_gap}
+variable        z_tool_bot   equal ${z_sub_top}+${h_layer}
+variable        z_tool_top   equal ${z_tool_bot}+${tool_height}
+variable        z_rod_top    equal ${z_tool_top}+${rod_extra}
+
+lattice         fcc ${a_sub}
+region          simbox block 0 ${Lx} 0 ${Ly} 0 ${Lz} units box
+create_box      4 simbox
+
+# ------------------------------------------------------------------
+# 2. REGIONS AND ATOMS
+# ------------------------------------------------------------------
+region          substrate  block 0 ${Lx} 0 ${Ly} 0 ${z_sub_top} units box
+region          rod        block $(v_cx-v_half_side) $(v_cx+v_half_side) &
+                                 $(v_cy-v_half_side) $(v_cy+v_half_side) &
+                                 ${z_rod_bot} ${z_rod_top} units box
+region          tool_outer cylinder z ${cx} ${cy} ${r_tool}  ${z_tool_bot} ${z_tool_top} side in  units box
+region          tool_inner cylinder z ${cx} ${cy} ${r_inner} ${z_tool_bot} ${z_tool_top} side out units box
+region          tool       intersect 2 tool_outer tool_inner units box
+
+lattice         fcc ${a_rod}
+create_atoms    1 region rod                 # Al feedstock
+lattice         fcc ${a_sub}
+create_atoms    2 region substrate           # Cu substrate
+lattice         bcc 3.165
+create_atoms    3 region tool                # W tool
+
+mass            1 26.982        # Al stock
+mass            2 63.546        # Cu substrate
+mass            3 183.840       # W tool
+mass            4 26.982        # Al deposited
+
+pair_style      eam/alloy
+pair_coeff      * * CuAlW.txt Al Cu W Al
+
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+# ------------------------------------------------------------------
+# 3. GROUPS
+# ------------------------------------------------------------------
+group           substrate region substrate
+group           feedrod   region rod
+group           tool      region tool
+
+# safety: remove any rod atom sitting on top of a substrate atom
+delete_atoms    overlap 2.0 feedrod substrate
+
+region          fixed_base  block INF INF INF INF 0 6  units box
+region          therm_layer block INF INF INF INF 6 16 units box
+group           fixed_base  region fixed_base
+group           substrate_flow subtract substrate fixed_base
+group           therm_tmp   region therm_layer
+group           therm_flow  subtract therm_tmp fixed_base
+
+variable        zrel   equal ${z_tool_bot}
+variable        isrel  atom "type==1 && z<v_zrel"
+
+group           released variable isrel
+set             group released type 4
+group           stock    subtract feedrod released
+group           spindle  union tool stock
+group           free     union substrate_flow released
+
+fix             freeze_base fixed_base setforce 0.0 0.0 0.0
+velocity        fixed_base set 0.0 0.0 0.0
+velocity        free create 300.0 12345 mom yes rot yes dist gaussian
+
+# ------------------------------------------------------------------
+# 4. KINEMATICS
+#    Edge speed = omega * r_tool = 6 A/ps (600 m/s)
+#    Mass balance: rod area (452 A^2) * Ufeed ~ 2 r_tool * h_layer * U * fill
+# ------------------------------------------------------------------
+variable        omega     equal 0.2      # rad/ps
+variable        U         equal 0.2      # traverse, A/ps
+variable        Ufeed     equal 0.2      # feed, A/ps
+
+variable        dt        equal 0.0005
+variable        nseg      equal 5000     # 250 ps -> 50 A track (x = 60 -> 110)
+variable        seg_steps equal 100
+variable        seg_time  equal ${seg_steps}*${dt}
+variable        dx_seg    equal ${U}*${seg_time}
+variable        dz_seg    equal -${Ufeed}*${seg_time}
+variable        period    equal 2.0*PI/${omega}
+
+# ------------------------------------------------------------------
+# 5. DIAGNOSTICS
+# ------------------------------------------------------------------
+compute         f_tool tool group/group free
+compute         Tsub   substrate_flow temp
+variable        ndep   equal count(released)
+
+thermo          1000
+thermo_style    custom step time c_Tsub v_ndep c_f_tool[1] c_f_tool[2] c_f_tool[3] pxx pyy lx ly
+thermo_modify   flush yes
+
+dump            traj all custom 4000 afsd_v3.dump id type x y z vx vy vz
+dump_modify     traj sort id
+
+timestep        ${dt}
+
+# ------------------------------------------------------------------
+# 6. PHASE 1 -- relax substrate at 300 K, x/y box free (z is a free surface)
+# ------------------------------------------------------------------
+group           eqgrp union substrate_flow released
+fix             equil_npt eqgrp npt temp 300.0 300.0 0.1 &
+                x 0.0 0.0 1.0 y 0.0 0.0 1.0 couple none dilate all
+run             20000
+unfix           equil_npt
+
+# ------------------------------------------------------------------
+# 7. PHASE 2 -- deposition (box fixed from here on)
+# ------------------------------------------------------------------
+fix             nve_free free nve
+fix             therm    therm_flow langevin 300.0 300.0 0.5 55555
+
+variable        iseg loop ${nseg}
+label           loop_start
+
+  fix             rot spindle move rotate ${cx} ${cy} 0 0 0 1 ${period} units box
+  run             ${seg_steps}
+  unfix           rot
+
+  displace_atoms  tool  move ${dx_seg} 0.0 0.0        units box
+  displace_atoms  stock move ${dx_seg} 0.0 ${dz_seg}  units box
+  variable        cx equal $(v_cx+v_dx_seg)
+
+  group           released variable isrel
+  group           free     variable isrel
+  set             group released type 4
+
+  group           stock   clear
+  group           stock   subtract feedrod released
+  group           spindle clear
+  group           spindle union tool stock
+
+next            iseg
+jump            SELF loop_start
+
+write_data      afsd_v3_final.data
